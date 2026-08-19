@@ -1,5 +1,10 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
 import { ProductCreatedDetail, ProductImage } from '../event-bridge.types';
 
 const client = new DynamoDBClient({ region: process.env.REGION });
@@ -8,6 +13,7 @@ const dynamo = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = process.env.DYNAMODB_TABLE_PRODUCTS!;
 
 export const putProduct = async (detail: ProductCreatedDetail): Promise<void> => {
+  console.log(`Putting product ${detail.productId} into DynamoDB table ${TABLE_NAME}`);
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,
