@@ -13,7 +13,6 @@ const dynamo = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = process.env.DYNAMODB_TABLE_PRODUCTS!;
 
 export const putProduct = async (detail: ProductCreatedDetail): Promise<void> => {
-  console.log(`Putting product ${detail.productId} into DynamoDB table ${TABLE_NAME}`);
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,
