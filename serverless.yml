@@ -1,0 +1,24 @@
+service: event-rule-lambdas
+
+plugins:
+  - serverless-offline
+
+build:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    target: node24
+    platform: node
+    external:
+      - '@aws-sdk/*'
+
+custom:
+  env: ${file(config/dev.yml)}
+
+provider:
+  name: aws
+  runtime: nodejs24.x
+  environment: ${self:custom.env}
+
+functions: ${file(config/functions.yml)}

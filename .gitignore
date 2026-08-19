@@ -1,0 +1,13 @@
+node_modules
+.serverless
+dist
+
+# Build artifacts
+.build/
+*.zip
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars.local

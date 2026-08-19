@@ -1,0 +1,367 @@
+name: Terraform
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+      - main
+    paths:
+      - 'terraform/**'
+      - 'src/**'
+  pull_request:
+    branches:
+      - develop
+      - staging
+      - main
+    paths:
+      - 'terraform/**'
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente a desplegar'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.10.0'
+  TF_VAR_aws_region: 'us-east-1'
+  WORKING_DIR: './terraform'
+  NODE_VERSION: '24'
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test -- --passWithNoTests
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform version
+        run: |
+          echo "📦 Terraform version: $(terraform version -json | jq -r '.terraform_version')"
+          echo "📂 Directorio de trabajo: ${{ env.WORKING_DIR }}"
+
+      - name: Format check
+        run: |
+          echo "🔍 Verificando formato del código..."
+          terraform fmt -check -recursive
+          echo "✅ Formato correcto"
+        working-directory: ${{ env.WORKING_DIR }}
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git auth
+        run: git config --global url."https://oauth2:${{ secrets.TF_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Resolve environment
+        id: resolve
+        run: |
+          BRANCH="${{ github.base_ref }}"
+          if [[ "$BRANCH" == "main" ]]; then
+            ENV="prod" && MODULE_REF="main"
+          elif [[ "$BRANCH" == "staging" ]]; then
+            ENV="staging" && MODULE_REF="staging"
+          else
+            ENV="dev" && MODULE_REF="develop"
+          fi
+          echo "environment=$ENV"                                                         >> $GITHUB_OUTPUT
+          echo "bucket=ctv-terraform-state-${ENV}"                                       >> $GITHUB_OUTPUT
+          echo "key=lambdas/event-rule/${ENV}/terraform.tfstate"             >> $GITHUB_OUTPUT
+          echo "module_ref=$MODULE_REF"                                                  >> $GITHUB_OUTPUT
+
+      - name: Set module branch
+        run: |
+          MODULE_REF="${{ steps.resolve.outputs.module_ref }}"
+          echo "🔀 Apuntando módulos a rama: $MODULE_REF"
+          find . -name "*.tf" -exec sed -i "s|\"sass-ecommerce/\([^/]*\)/\(.*\)\"|\"git::https://github.com/sass-ecommerce/\1.git//\2?ref=${MODULE_REF}\"|g" {} +
+          echo "📦 Sources resueltos:"
+          grep -r "source" .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ github.workspace }}
+
+      - name: Build Lambda (esbuild)
+        run: npm run build
+        working-directory: ${{ github.workspace }}
+
+      - name: Package Lambda (zip)
+        run: npm run package
+        working-directory: ${{ github.workspace }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.base_ref == 'main' && secrets.AWS_ROLE_ARN_PROD || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.TF_VAR_aws_region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.resolve.outputs.bucket }}" \
+            -backend-config="key=${{ steps.resolve.outputs.key }}" \
+            -backend-config="region=${{ env.TF_VAR_aws_region }}"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -var="environment=${{ steps.resolve.outputs.environment }}" -no-color 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Comment Plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('${{ env.WORKING_DIR }}/plan_output.txt', 'utf8');
+            const status = '${{ steps.plan.outcome }}';
+            const statusIcon = status === 'success' ? '✅' : '❌';
+            const env = '${{ steps.resolve.outputs.environment }}';
+
+            const body = `### ${statusIcon} Terraform Plan — \`${env}\`
+
+            <details><summary>Ver plan completo</summary>
+
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            **Estado:** \`${status}\`
+            **Rama:** \`${{ github.head_ref }}\`
+            **Commit:** \`${{ github.sha }}\``;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push'
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git auth
+        run: git config --global url."https://oauth2:${{ secrets.TF_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Resolve environment
+        id: resolve
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          if [[ "$BRANCH" == "main" ]]; then
+            ENV="prod" && MODULE_REF="main"
+          elif [[ "$BRANCH" == "staging" ]]; then
+            ENV="staging" && MODULE_REF="staging"
+          else
+            ENV="dev" && MODULE_REF="develop"
+          fi
+          echo "environment=$ENV"                                                         >> $GITHUB_OUTPUT
+          echo "bucket=ctv-terraform-state-${ENV}"                                       >> $GITHUB_OUTPUT
+          echo "key=lambdas/event-rule/${ENV}/terraform.tfstate"             >> $GITHUB_OUTPUT
+          echo "module_ref=$MODULE_REF"                                                  >> $GITHUB_OUTPUT
+
+      - name: Set module branch
+        run: |
+          MODULE_REF="${{ steps.resolve.outputs.module_ref }}"
+          echo "🔀 Apuntando módulos a rama: $MODULE_REF"
+          find . -name "*.tf" -exec sed -i "s|\"sass-ecommerce/\([^/]*\)/\(.*\)\"|\"git::https://github.com/sass-ecommerce/\1.git//\2?ref=${MODULE_REF}\"|g" {} +
+          echo "📦 Sources resueltos:"
+          grep -r "source" .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ github.workspace }}
+
+      - name: Build Lambda (esbuild)
+        run: npm run build
+        working-directory: ${{ github.workspace }}
+
+      - name: Package Lambda (zip)
+        run: npm run package
+        working-directory: ${{ github.workspace }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.ref_name == 'main' && secrets.AWS_ROLE_ARN_PROD || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.TF_VAR_aws_region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.resolve.outputs.bucket }}" \
+            -backend-config="key=${{ steps.resolve.outputs.key }}" \
+            -backend-config="region=${{ env.TF_VAR_aws_region }}"
+
+      - name: Terraform Plan
+        run: terraform plan -var="environment=${{ steps.resolve.outputs.environment }}" -no-color -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  terraform-deploy:
+    name: Terraform Deploy (on-demand)
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git auth
+        run: git config --global url."https://oauth2:${{ secrets.TF_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Resolve environment
+        id: resolve
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          if [[ "$ENV" == "prod" ]]; then MODULE_REF="main"
+          elif [[ "$ENV" == "staging" ]]; then MODULE_REF="staging"
+          else MODULE_REF="develop"
+          fi
+          echo "environment=$ENV"                                                         >> $GITHUB_OUTPUT
+          echo "bucket=ctv-terraform-state-${ENV}"                                       >> $GITHUB_OUTPUT
+          echo "key=lambdas/event-rule/${ENV}/terraform.tfstate"             >> $GITHUB_OUTPUT
+          echo "module_ref=$MODULE_REF"                                                  >> $GITHUB_OUTPUT
+
+      - name: Set module branch
+        run: |
+          MODULE_REF="${{ steps.resolve.outputs.module_ref }}"
+          echo "🔀 Apuntando módulos a rama: $MODULE_REF"
+          find . -name "*.tf" -exec sed -i "s|\"sass-ecommerce/\([^/]*\)/\(.*\)\"|\"git::https://github.com/sass-ecommerce/\1.git//\2?ref=${MODULE_REF}\"|g" {} +
+          echo "📦 Sources resueltos:"
+          grep -r "source" .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ github.workspace }}
+
+      - name: Build Lambda (esbuild)
+        run: npm run build
+        working-directory: ${{ github.workspace }}
+
+      - name: Package Lambda (zip)
+        run: npm run package
+        working-directory: ${{ github.workspace }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.event.inputs.environment == 'prod' && secrets.AWS_ROLE_ARN_PROD || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.TF_VAR_aws_region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.resolve.outputs.bucket }}" \
+            -backend-config="key=${{ steps.resolve.outputs.key }}" \
+            -backend-config="region=${{ env.TF_VAR_aws_region }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -var="environment=${{ steps.resolve.outputs.environment }}" -no-color -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan

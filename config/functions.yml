@@ -1,0 +1,7 @@
+eventBridgeProducts:
+  handler: src/event-rule-products/index.eventBridgeProducts
+  description: EventBridge rule trigger — logs incoming product events
+  events:
+    - httpApi:
+        path: /eventbridge-products
+        method: post
